@@ -128,6 +128,15 @@ if ('serviceWorker' in navigator) {
   .trim-foot { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--muted); }
   .trim-btns { display: flex; gap: 8px; }
 
+  details.adv { border-top: 1px solid var(--line); padding-top: 14px; }
+  details.adv summary {
+    cursor: pointer; user-select: none;
+    font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); font-weight: 600;
+  }
+  details.adv summary:hover { color: var(--ink); }
+  details.adv[open] summary { margin-bottom: 12px; }
+
   .target { display: flex; flex-direction: column; gap: 8px; }
   .target .metric .value small { display: block; font-size: 12px; margin-top: 2px; }
   .target-hint { font-size: 12px; color: var(--muted); }
@@ -221,7 +230,9 @@ if ('serviceWorker' in navigator) {
       </div>
     </div>
 
-    <div class="trim">
+    <details class="adv">
+      <summary>Advanced</summary>
+      <div class="trim">
       <h2 class="section">Data range</h2>
       <div class="trim-row">
         <span class="tlab">Start</span>
@@ -240,7 +251,8 @@ if ('serviceWorker' in navigator) {
           <button class="btn" id="trimReset">Reset</button>
         </span>
       </div>
-    </div>
+      </div>
+    </details>
 
     <div>
       <h2 class="section">Current fix</h2>
