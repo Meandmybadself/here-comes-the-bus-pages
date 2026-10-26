@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bus Route Visualizer</title>
+<script>
+// A service worker left over from a previous app served on this same port
+// (e.g. localhost:8000) will hijack and break the Leaflet CDN requests.
+// Unregister any SW and clear its caches, then reload once so the page
+// loads uncontrolled.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then(function (regs) {
+    if (!regs.length) return;
+    Promise.all(regs.map(function (r) { return r.unregister(); }))
+      .then(function () {
+        return window.caches
+          ? caches.keys().then(function (ks) { return Promise.all(ks.map(function (k) { return caches.delete(k); })); })
+          : null;
+      })
+      .then(function () {
+        if (!sessionStorage.getItem('busviz-swcleared')) {
+          sessionStorage.setItem('busviz-swcleared', '1');
+          location.reload();
+        }
+      });
+  }).catch(function () {});
+}
+</script>
+<link rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --ink: #1a1d24;
+    --muted: #6b7280;
+    --line: #e2e5ea;
+    --accent: #2563eb;
+    --accent-soft: #dbe6ff;
+    --traveled: #2563eb;
+    --remaining: #b9c0cc;
+    --start: #16a34a;
+    --end: #dc2626;
+    --target: #d97706;
+    --shadow: 0 1px 3px rgba(0,0,0,.08), 0 8px 24px rgba(0,0,0,.06);
+  }
+  :root:not([data-theme="light"]) {
+    @media (prefers-color-scheme: dark) {
+      --bg: #0f1115; --panel: #171a21; --ink: #e8eaed; --muted: #9aa3b2;
+      --line: #262b34; --accent: #5b8cff; --accent-soft: #1e2a44;
+      --traveled: #5b8cff; --remaining: #3a414d; --start: #34d399; --end: #f87171;
+      --target: #fbbf24;
+      --shadow: 0 1px 3px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1115; --panel: #171a21; --ink: #e8eaed; --muted: #9aa3b2;
+    --line: #262b34; --accent: #5b8cff; --accent-soft: #1e2a44;
+    --traveled: #5b8cff; --remaining: #3a414d; --start: #34d399; --end: #f87171;
+    --target: #fbbf24;
+    --shadow: 0 1px 3px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    flex: none;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header .spacer { flex: 1; }
+  .btn {
+    font: inherit; font-size: 13px; font-weight: 550; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    padding: 7px 14px; border-radius: 8px; transition: background .12s, border-color .12s;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn.primary:hover { filter: brightness(1.05); }
+  .btn:disabled { opacity: .45; cursor: default; }
+
+  main { flex: 1; display: flex; min-height: 0; }
+  #map { flex: 1; min-width: 0; background: var(--bg); }
+  aside {
+    width: 320px; flex: none; background: var(--panel); border-left: 1px solid var(--line);
+    padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 18px;
+  }
+
+  .drop {
+    margin: auto; max-width: 440px; text-align: center; padding: 40px;
+  }
+  .dropzone {
+    border: 2px dashed var(--line); border-radius: 14px; padding: 40px 24px;
+    color: var(--muted); transition: border-color .15s, background .15s; cursor: pointer;
+  }
+  .dropzone.over { border-color: var(--accent); background: var(--accent-soft); color: var(--ink); }
+  .dropzone strong { color: var(--ink); display: block; font-size: 17px; margin-bottom: 6px; }
+
+  .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .metric {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+  }
+  .metric.wide { grid-column: 1 / -1; }
+  .metric .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .metric .value { font-size: 22px; font-weight: 650; margin-top: 3px; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .metric .value small { font-size: 13px; font-weight: 500; color: var(--muted); }
+
+  .bars { display: flex; flex-direction: column; gap: 12px; }
+  .bar-row .bar-head { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  .bar { height: 7px; background: var(--remaining); border-radius: 99px; overflow: hidden; }
+  .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 99px; width: 0; transition: width .08s linear; }
+
+  .scrubber { display: flex; flex-direction: column; gap: 10px; }
+  .transport { display: flex; align-items: center; gap: 10px; }
+  input[type=range] { flex: 1; width: 100%; accent-color: var(--accent); cursor: pointer; }
+
+  .trim { display: flex; flex-direction: column; gap: 8px; }
+  .trim-row { display: flex; align-items: center; gap: 10px; }
+  .trim-row .tlab { font-size: 12px; color: var(--muted); width: 34px; flex: none; }
+  .trim-row .tval { font-size: 12px; color: var(--ink); font-variant-numeric: tabular-nums; width: 86px; flex: none; text-align: right; }
+  .trim-foot { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--muted); }
+  .trim-btns { display: flex; gap: 8px; }
+
+  .target { display: flex; flex-direction: column; gap: 8px; }
+  .target .metric .value small { display: block; font-size: 12px; margin-top: 2px; }
+  .target-hint { font-size: 12px; color: var(--muted); }
+  .target-actions { display: flex; gap: 8px; }
+  .target-actions .btn { flex: 1; }
+
+  .fix { font-size: 13px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+  .fix div { display: flex; justify-content: space-between; gap: 12px; }
+  .fix .k { color: var(--muted); }
+  .fix .v { color: var(--ink); font-variant-numeric: tabular-nums; text-align: right; }
+
+  h2.section { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 -4px; font-weight: 600; }
+
+  .hidden { display: none !important; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); }
+  .legend i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; margin-right: 5px; vertical-align: -1px; }
+
+  @media (max-width: 760px) {
+    main { flex-direction: column; }
+    aside { width: 100%; border-left: none; border-top: 1px solid var(--line); max-height: 48%; }
+    #map { min-height: 240px; }
+  }
+  .bus-marker { font-size: 26px; line-height: 1; filter: drop-shadow(0 1px 2px rgba(0,0,0,.4)); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🚌 Bus Route Visualizer</h1>
+  <span class="sub" id="source"></span>
+  <span class="spacer"></span>
+  <button class="btn" id="loadBtn">Load file…</button>
+  <button class="btn" id="themeBtn" title="Toggle theme">◐</button>
+  <input type="file" id="file" accept=".har,.json" class="hidden">
+</header>
+
+<main>
+  <div id="map"></div>
+  <aside id="panel" class="hidden">
+    <div class="metrics">
+      <div class="metric">
+        <div class="label">Route progress</div>
+        <div class="value" id="mRoutePct">0<small>%</small></div>
+      </div>
+      <div class="metric">
+        <div class="label">Time progress</div>
+        <div class="value" id="mTimePct">0<small>%</small></div>
+      </div>
+      <div class="metric">
+        <div class="label">Elapsed</div>
+        <div class="value" id="mElapsed">0:00</div>
+      </div>
+      <div class="metric">
+        <div class="label">Total time</div>
+        <div class="value" id="mTotal">0:00</div>
+      </div>
+      <div class="metric wide">
+        <div class="label">Distance traveled</div>
+        <div class="value" id="mDist">0 <small>of 0 mi</small></div>
+      </div>
+    </div>
+
+    <div class="bars">
+      <div class="bar-row">
+        <div class="bar-head"><span>Route</span><span id="bRoutePct">0%</span></div>
+        <div class="bar"><span id="bRoute"></span></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-head"><span>Time</span><span id="bTimePct">0%</span></div>
+        <div class="bar"><span id="bTime"></span></div>
+      </div>
+    </div>
+
+    <div class="scrubber">
+      <h2 class="section">Timeline</h2>
+      <div class="transport">
+        <button class="btn" id="playBtn">▶ Play</button>
+        <input type="range" id="scrub" min="0" max="0" value="0" step="1">
+      </div>
+    </div>
+
+    <div class="target">
+      <h2 class="section">Target point</h2>
+      <div class="metric">
+        <div class="label" id="targetLabel">Target</div>
+        <div class="value" id="targetValue">—</div>
+      </div>
+      <div class="target-hint">Click the route on the map to place a target, or pin the current fix.</div>
+      <div class="target-actions">
+        <button class="btn" id="targetSet">Set to current fix</button>
+        <button class="btn" id="targetClear" disabled>Clear</button>
+      </div>
+    </div>
+
+    <div class="trim">
+      <h2 class="section">Data range</h2>
+      <div class="trim-row">
+        <span class="tlab">Start</span>
+        <input type="range" id="trimStart" min="0" max="0" value="0" step="1">
+        <span class="tval" id="trimStartLabel">—</span>
+      </div>
+      <div class="trim-row">
+        <span class="tlab">End</span>
+        <input type="range" id="trimEnd" min="0" max="0" value="0" step="1">
+        <span class="tval" id="trimEndLabel">—</span>
+      </div>
+      <div class="trim-foot">
+        <span id="trimCount"></span>
+        <span class="trim-btns">
+          <button class="btn" id="trimSave" title="Download the trimmed window as JSON">Save…</button>
+          <button class="btn" id="trimReset">Reset</button>
+        </span>
+      </div>
+    </div>
+
+    <div>
+      <h2 class="section">Current fix</h2>
+      <div class="fix" id="fix"></div>
+    </div>
+
+    <div class="legend">
+      <span><i style="background:var(--start)"></i>Start</span>
+      <span><i style="background:var(--traveled)"></i>Traveled</span>
+      <span><i style="background:var(--remaining)"></i>Remaining</span>
+      <span><i style="background:var(--end)"></i>End</span>
+      <span><i style="background:var(--target)"></i>Target</span>
+    </div>
+  </aside>
+
+  <div class="drop" id="drop">
+    <div class="dropzone" id="dropzone">
+      <strong>Drop a HAR or JSON file here</strong>
+      A <code>.har</code> capture from the app, or the logger's
+      <code>bus_locations.json</code>. Click to browse.
+    </div>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+"use strict";
+
+// ---------- theme ----------
+const root = document.documentElement;
+document.getElementById('themeBtn').onclick = () => {
+  const cur = root.getAttribute('data-theme');
+  const next = cur === 'dark' ? 'light' : cur === 'light' ? 'dark'
+    : (matchMedia('(prefers-color-scheme: dark)').matches ? 'light' : 'dark');
+  root.setAttribute('data-theme', next);
+  try { localStorage.setItem('busviz-theme', next); } catch (e) {}
+  setTimeout(() => map && map.invalidateSize(), 50);
+};
+try { const t = localStorage.getItem('busviz-theme'); if (t) root.setAttribute('data-theme', t); } catch (e) {}
+
+// ---------- map ----------
+let map = L.map('map', { zoomControl: true }).setView([44.92, -93.45], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+let fullLine = null, traveledLine = null, busMarker = null, startMarker = null, endMarker = null;
+let allPoints = [], points = [], cumDist = [], totalDist = 0, totalMs = 0;
+let targetKey = null, targetMarker = null;
+
+function pointKey(p) { return p.logTime || `${p.lat},${p.lon}`; }
+function findTargetPoint() {
+  if (targetKey == null) return null;
+  return allPoints.find(p => pointKey(p) === targetKey) || null;
+}
+
+// ---------- decoding ----------
+function atobUtf8(s) {
+  const bin = atob(s.trim());
+  try { return decodeURIComponent(escape(bin)); } catch (e) { return bin; }
+}
+// Try JSON, then base64->JSON, then base64->base64->JSON.
+function deepDecode(text) {
+  let t = text;
+  for (let i = 0; i < 3; i++) {
+    try { return JSON.parse(t); } catch (e) {}
+    try { t = atobUtf8(t); } catch (e) { return null; }
+  }
+  return null;
+}
+
+function pointsFromHar(har) {
+  const entries = (har.log && har.log.entries) || [];
+  const out = [];
+  for (const e of entries) {
+    const url = (e.request && e.request.url) || '';
+    if (!url.includes('GetStudentStopsAndScansForAllStudents')) continue;
+    const c = (e.response && e.response.content) || {};
+    let text = c.text || '';
+    if (!text) continue;
+    if (c.encoding === 'base64') { try { text = atobUtf8(text); } catch (e2) {} }
+    const obj = deepDecode(text);
+    if (!obj) continue;
+    const arr = obj.studentStopAndScans || [];
+    for (const s of arr) {
+      const v = s.vehicleLocation;
+      if (v && typeof v.latitude === 'number' && typeof v.longitude === 'number') {
+        out.push(normalize(v));
+      }
+    }
+  }
+  return out;
+}
+
+function pointsFromJson(arr) {
+  return arr.filter(r => r && r.latitude != null && r.longitude != null).map(normalize);
+}
+
+function normalize(v) {
+  return {
+    lat: v.latitude, lon: v.longitude,
+    logTime: v.logTime || v.recordedAt || null,
+    speed: v.speed, heading: v.heading, address: v.address,
+    name: v.name || v.busName,
+    _raw: v // original record, kept so "Save…" round-trips the logger format
+  };
+}
+
+// ---------- geometry ----------
+function haversineMiles(a, b) {
+  const R = 3958.7613, toRad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * toRad, dLon = (b.lon - a.lon) * toRad;
+  const la1 = a.lat * toRad, la2 = b.lat * toRad;
+  const h = Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+// ---------- load ----------
+function load(points_) {
+  // dedupe by logTime, keep order, then sort by time
+  const seen = new Set();
+  allPoints = points_.filter(p => {
+    const k = p.logTime || `${p.lat},${p.lon}`;
+    if (seen.has(k)) return false; seen.add(k); return true;
+  });
+  allPoints.sort((a, b) => new Date(a.logTime || 0) - new Date(b.logTime || 0));
+
+  if (allPoints.length < 1) {
+    alert('No bus locations found in that file.');
+    return;
+  }
+
+  targetKey = null; // target belongs to the previous dataset
+
+  // reset the data-range trim to the full dataset
+  trimStartEl.min = 0; trimStartEl.max = allPoints.length - 1; trimStartEl.value = 0;
+  trimEndEl.min = 0; trimEndEl.max = allPoints.length - 1; trimEndEl.value = allPoints.length - 1;
+  applyTrim(true);
+}
+
+// Rebuild the rendered route from the trimmed window of allPoints.
+// fit=true re-centers the map (fresh load); trim adjustments keep the view.
+function applyTrim(fit) {
+  const s = +trimStartEl.value, e = +trimEndEl.value;
+  points = allPoints.slice(s, e + 1);
+
+  trimStartLabel.textContent = fmtTrimLabel(allPoints[s].logTime);
+  trimEndLabel.textContent = fmtTrimLabel(allPoints[e].logTime);
+  trimCount.textContent = points.length + ' of ' + allPoints.length + ' fixes';
+
+  cumDist = [0]; totalDist = 0;
+  for (let i = 1; i < points.length; i++) {
+    totalDist += haversineMiles(points[i-1], points[i]);
+    cumDist.push(totalDist);
+  }
+  const t0 = new Date(points[0].logTime), t1 = new Date(points[points.length-1].logTime);
+  totalMs = Math.max(0, t1 - t0);
+
+  // draw
+  [fullLine, traveledLine, busMarker, startMarker, endMarker, targetMarker].forEach(l => l && map.removeLayer(l));
+  targetMarker = null;
+  const latlngs = points.map(p => [p.lat, p.lon]);
+  const css = getComputedStyle(root);
+  fullLine = L.polyline(latlngs, { color: css.getPropertyValue('--remaining').trim(), weight: 5, opacity: .9 }).addTo(map);
+  traveledLine = L.polyline([], { color: css.getPropertyValue('--traveled').trim(), weight: 5, opacity: 1 }).addTo(map);
+  startMarker = L.circleMarker(latlngs[0], { radius: 7, color: '#fff', weight: 2, fillColor: css.getPropertyValue('--start').trim(), fillOpacity: 1 }).addTo(map).bindTooltip('Start');
+  endMarker = L.circleMarker(latlngs[latlngs.length-1], { radius: 7, color: '#fff', weight: 2, fillColor: css.getPropertyValue('--end').trim(), fillOpacity: 1 }).addTo(map).bindTooltip('End');
+  busMarker = L.marker(latlngs[0], { icon: L.divIcon({ className: '', html: '<div class="bus-marker">🚌</div>', iconSize: [26,26], iconAnchor: [13,13] }) }).addTo(map);
+  fullLine.on('click', ev => setTarget(nearestPoint(ev.latlng)));
+  renderTargetMarker();
+
+  if (fit) {
+    if (points.length > 1) map.fitBounds(fullLine.getBounds(), { padding: [40, 40] });
+    else map.setView(latlngs[0], 15);
+  }
+
+  const scrub = document.getElementById('scrub');
+  scrub.max = points.length - 1; scrub.value = 0;
+
+  document.getElementById('panel').classList.remove('hidden');
+  document.getElementById('drop').classList.add('hidden');
+  map.invalidateSize();
+  update(points.length - 1); // show the whole route by default
+  scrub.value = points.length - 1;
+}
+
+// ---------- scrub / render ----------
+function fmtDur(ms) {
+  if (!isFinite(ms) || ms < 0) ms = 0;
+  const s = Math.round(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const mm = String(m).padStart(2, '0'), ss = String(sec).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}
+function fmtClock(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+}
+// Trim-slider label: add the date when the loaded data spans more than one day.
+function fmtTrimLabel(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  const first = new Date(allPoints[0].logTime), last = new Date(allPoints[allPoints.length - 1].logTime);
+  const multiDay = !isNaN(first) && !isNaN(last) && first.toDateString() !== last.toDateString();
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return multiDay
+    ? d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + time
+    : d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+}
+
+function update(i) {
+  i = Math.max(0, Math.min(points.length - 1, i|0));
+  const p = points[i];
+  const routePct = totalDist > 0 ? (cumDist[i] / totalDist) * 100 : (i / Math.max(1, points.length-1)) * 100;
+  const elapsedMs = new Date(p.logTime) - new Date(points[0].logTime);
+  const timePct = totalMs > 0 ? (elapsedMs / totalMs) * 100 : routePct;
+
+  document.getElementById('mRoutePct').innerHTML = routePct.toFixed(1) + '<small>%</small>';
+  document.getElementById('mTimePct').innerHTML = timePct.toFixed(1) + '<small>%</small>';
+  document.getElementById('mElapsed').textContent = fmtDur(elapsedMs);
+  document.getElementById('mTotal').textContent = fmtDur(totalMs);
+  document.getElementById('mDist').innerHTML =
+    (totalDist > 0 ? cumDist[i].toFixed(2) : '0') + ' <small>of ' + totalDist.toFixed(2) + ' mi</small>';
+
+  document.getElementById('bRoute').style.width = routePct + '%';
+  document.getElementById('bTime').style.width = timePct + '%';
+  document.getElementById('bRoutePct').textContent = routePct.toFixed(0) + '%';
+  document.getElementById('bTimePct').textContent = timePct.toFixed(0) + '%';
+
+  const rows = [
+    ['Time', fmtClock(p.logTime)],
+    ['Position', `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`],
+    ['Speed', p.speed != null ? p.speed + ' mph' : '—'],
+    ['Heading', p.heading || '—'],
+    ['Fix', `${i + 1} of ${points.length}`],
+    ['Address', p.address || '—'],
+  ];
+  document.getElementById('fix').innerHTML = rows.map(
+    ([k, v]) => `<div><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
+
+  busMarker.setLatLng([p.lat, p.lon]);
+  traveledLine.setLatLngs(points.slice(0, i + 1).map(q => [q.lat, q.lon]));
+  updateTargetReadout(p);
+}
+
+// ---------- target point ----------
+// Nearest fix (in the current window) to a clicked map location.
+function nearestPoint(latlng) {
+  const cosLat = Math.cos(latlng.lat * Math.PI / 180);
+  let best = points[0], bestD = Infinity;
+  for (const p of points) {
+    const dLat = p.lat - latlng.lat, dLon = (p.lon - latlng.lng) * cosLat;
+    const d = dLat * dLat + dLon * dLon;
+    if (d < bestD) { bestD = d; best = p; }
+  }
+  return best;
+}
+
+function setTarget(p) {
+  if (!p) return;
+  targetKey = pointKey(p);
+  renderTargetMarker();
+  updateTargetReadout(points[+scrub.value]);
+}
+
+function clearTarget() {
+  targetKey = null;
+  if (targetMarker) { map.removeLayer(targetMarker); targetMarker = null; }
+  updateTargetReadout(points[+scrub.value]);
+}
+
+function renderTargetMarker() {
+  if (targetMarker) { map.removeLayer(targetMarker); targetMarker = null; }
+  const tp = findTargetPoint();
+  if (!tp) return;
+  const color = getComputedStyle(root).getPropertyValue('--target').trim();
+  targetMarker = L.circleMarker([tp.lat, tp.lon], {
+    radius: 8, color: '#fff', weight: 2, fillColor: color, fillOpacity: 1
+  }).addTo(map).bindTooltip('Target — ' + fmtClock(tp.logTime));
+}
+
+function updateTargetReadout(cur) {
+  const label = document.getElementById('targetLabel');
+  const value = document.getElementById('targetValue');
+  const tp = findTargetPoint();
+  document.getElementById('targetClear').disabled = !tp;
+  if (!tp || !cur) {
+    label.textContent = 'Target';
+    value.textContent = '—';
+    return;
+  }
+  const delta = new Date(tp.logTime) - new Date(cur.logTime);
+  if (delta > 0) {
+    label.textContent = 'Until target';
+    value.innerHTML = fmtDur(delta) + '<small>arrives ' + fmtClock(tp.logTime) + '</small>';
+  } else if (delta < 0) {
+    label.textContent = 'Past target';
+    value.innerHTML = '+' + fmtDur(-delta) + '<small>passed ' + fmtClock(tp.logTime) + '</small>';
+  } else {
+    label.textContent = 'At target';
+    value.innerHTML = '0:00<small>' + fmtClock(tp.logTime) + '</small>';
+  }
+}
+
+// ---------- controls ----------
+const scrub = document.getElementById('scrub');
+scrub.addEventListener('input', () => { stopPlay(); update(+scrub.value); });
+
+// data-range trim
+const trimStartEl = document.getElementById('trimStart');
+const trimEndEl = document.getElementById('trimEnd');
+const trimStartLabel = document.getElementById('trimStartLabel');
+const trimEndLabel = document.getElementById('trimEndLabel');
+const trimCount = document.getElementById('trimCount');
+
+trimStartEl.addEventListener('input', () => {
+  if (+trimStartEl.value > +trimEndEl.value) trimEndEl.value = trimStartEl.value;
+  stopPlay(); applyTrim();
+});
+trimEndEl.addEventListener('input', () => {
+  if (+trimEndEl.value < +trimStartEl.value) trimStartEl.value = trimEndEl.value;
+  stopPlay(); applyTrim();
+});
+// target point
+document.getElementById('targetSet').addEventListener('click', () => {
+  if (points.length) setTarget(points[+scrub.value]);
+});
+document.getElementById('targetClear').addEventListener('click', clearTarget);
+
+document.getElementById('trimReset').addEventListener('click', () => {
+  trimStartEl.value = 0; trimEndEl.value = allPoints.length - 1;
+  stopPlay(); applyTrim();
+});
+
+// download the trimmed window as a JSON file in the logger's own format,
+// so it can be re-loaded here or shipped as the Pages site's data/route.json
+document.getElementById('trimSave').addEventListener('click', () => {
+  if (!points.length) return;
+  const rows = points.map(p => p._raw || {
+    logTime: p.logTime, latitude: p.lat, longitude: p.lon,
+    heading: p.heading, speed: p.speed, address: p.address, busName: p.name
+  });
+  const d = new Date(points[0].logTime);
+  const name = isNaN(d) ? 'route.json' :
+    `route_${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}.json`;
+  const blob = new Blob([JSON.stringify(rows, null, 1)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+});
+
+let playTimer = null;
+const playBtn = document.getElementById('playBtn');
+function stopPlay() { if (playTimer) { clearInterval(playTimer); playTimer = null; playBtn.textContent = '▶ Play'; } }
+playBtn.addEventListener('click', () => {
+  if (playTimer) { stopPlay(); return; }
+  if (+scrub.value >= points.length - 1) scrub.value = 0;
+  playBtn.textContent = '❚❚ Pause';
+  playTimer = setInterval(() => {
+    let v = +scrub.value + 1;
+    if (v > points.length - 1) { stopPlay(); return; }
+    scrub.value = v; update(v);
+  }, 180);
+});
+
+// ---------- file input ----------
+const fileInput = document.getElementById('file');
+document.getElementById('loadBtn').onclick = () => fileInput.click();
+document.getElementById('dropzone').onclick = () => fileInput.click();
+fileInput.onchange = () => { if (fileInput.files[0]) readFile(fileInput.files[0]); };
+
+function readFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    let data;
+    try { data = JSON.parse(reader.result); }
+    catch (e) { alert('Could not parse file as JSON/HAR: ' + e.message); return; }
+    let pts;
+    if (data && data.log && data.log.entries) pts = pointsFromHar(data);
+    else if (Array.isArray(data)) pts = pointsFromJson(data);
+    else { alert('Unrecognized file. Expected a HAR or a JSON array of locations.'); return; }
+    document.getElementById('source').textContent = file.name + ' — ' + pts.length + ' points';
+    load(pts);
+  };
+  reader.readAsText(file);
+}
+
+const dz = document.getElementById('dropzone');
+['dragenter','dragover'].forEach(ev => document.addEventListener(ev, e => {
+  e.preventDefault(); dz.classList.add('over');
+}));
+['dragleave','drop'].forEach(ev => document.addEventListener(ev, e => {
+  e.preventDefault(); if (ev === 'drop' || e.target === dz) dz.classList.remove('over');
+}));
+document.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('over');
+  const f = e.dataTransfer.files[0]; if (f) readFile(f);
+});
+
+// ---------- auto-load (works when served over http) ----------
+// data/route.json is the shipped Pages dataset; bus_locations.json is the
+// local logger output. First one that exists wins.
+(async () => {
+  for (const src of ['data/route.json', 'bus_locations.json']) {
+    try {
+      const r = await fetch(src);
+      if (!r.ok) continue;
+      const arr = await r.json();
+      if (Array.isArray(arr) && arr.length) {
+        document.getElementById('source').textContent = src + ' — ' + arr.length + ' points';
+        load(pointsFromJson(arr));
+        return;
+      }
+    } catch (e) {/* try the next source */}
+  }
+  // nothing found — wait for a dropped file
+})();
+</script>
+</body>
+</html>
